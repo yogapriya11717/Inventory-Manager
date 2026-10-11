@@ -1,28 +1,44 @@
+
+import os
+import sqlite3
+from pathlib import Path
+
+import psycopg
+from psycopg.rows import dict_row
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import sqlite3
 
 
 # ==========================================
-# CREATE FASTAPI APPLICATION
+# LOAD ENVIRONMENT VARIABLES
+# ==========================================
+
+load_dotenv(Path(__file__).with_name(".env"))
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+# ==========================================
+# FASTAPI APPLICATION
 # ==========================================
 
 app = FastAPI(
     title="Inventory Manager API",
-    description="Backend for the Inventory Manager project",
+    description="Inventory management with persistent PostgreSQL storage",
     version="1.0.0"
 )
 
 
 # ==========================================
-# CORS CONFIGURATION
+# CORS
 # ==========================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -33,74 +49,72 @@ app.add_middleware(
 # ==========================================
 
 def get_db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is missing. Check backend/.env."
+        )
 
-    connection = sqlite3.connect("inventory.db")
-
-    connection.row_factory = sqlite3.Row
-
-    # Enable foreign key constraints
-    connection.execute("PRAGMA foreign_keys = ON")
-
-    return connection
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row
+    )
 
 
 # ==========================================
-# CREATE DATABASE TABLES
+# CREATE POSTGRESQL TABLES
 # ==========================================
 
 def create_tables():
-
     connection = get_db_connection()
 
     try:
-
-        # Products
         connection.execute("""
             CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 category TEXT NOT NULL,
-                quantity INTEGER NOT NULL CHECK(quantity >= 0),
-                minimum_stock INTEGER NOT NULL CHECK(minimum_stock >= 0)
+                quantity INTEGER NOT NULL CHECK (quantity >= 0),
+                minimum_stock INTEGER NOT NULL
+                    CHECK (minimum_stock >= 0)
             )
         """)
 
-        # Stock movement history
         connection.execute("""
             CREATE TABLE IF NOT EXISTS stock_movements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id INTEGER NOT NULL,
-                type TEXT NOT NULL CHECK(type IN ('IN', 'OUT')),
-                quantity INTEGER NOT NULL CHECK(quantity > 0),
-                balance INTEGER NOT NULL CHECK(balance >= 0),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (product_id)
-                    REFERENCES products(id)
-                    ON DELETE CASCADE
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER NOT NULL
+                    REFERENCES products(id) ON DELETE CASCADE,
+                type TEXT NOT NULL CHECK (type IN ('IN', 'OUT')),
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                balance INTEGER NOT NULL CHECK (balance >= 0),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        # Usage history
         connection.execute("""
             CREATE TABLE IF NOT EXISTS usage_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id INTEGER NOT NULL,
-                quantity_used INTEGER NOT NULL CHECK(quantity_used > 0),
-                remaining_stock INTEGER NOT NULL CHECK(remaining_stock >= 0),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (product_id)
-                    REFERENCES products(id)
-                    ON DELETE CASCADE
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER NOT NULL
+                    REFERENCES products(id) ON DELETE CASCADE,
+                quantity_used INTEGER NOT NULL
+                    CHECK (quantity_used > 0),
+                remaining_stock INTEGER NOT NULL
+                    CHECK (remaining_stock >= 0),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
         connection.commit()
 
+    except Exception:
+        connection.rollback()
+        raise
+
     finally:
         connection.close()
 
 
-# Create the tables when the application starts
+# Create tables when the application starts
 create_tables()
 
 
@@ -109,7 +123,6 @@ create_tables()
 # ==========================================
 
 class Product(BaseModel):
-
     name: str = Field(min_length=1)
     category: str = Field(min_length=1)
     quantity: int = Field(ge=0)
@@ -117,7 +130,6 @@ class Product(BaseModel):
 
 
 class StockChange(BaseModel):
-
     product_id: int = Field(gt=0)
     quantity: int = Field(gt=0)
 
@@ -128,9 +140,9 @@ class StockChange(BaseModel):
 
 @app.get("/")
 def home():
-
     return {
-        "message": "Inventory Manager Backend is running!"
+        "message": "Inventory Manager Backend is running!",
+        "database": "PostgreSQL"
     }
 
 
@@ -140,16 +152,14 @@ def home():
 
 @app.get("/products")
 def get_products():
-
     connection = get_db_connection()
 
     try:
-
-        products = connection.execute(
+        rows = connection.execute(
             "SELECT * FROM products ORDER BY id"
         ).fetchall()
 
-        return [dict(product) for product in products]
+        return [dict(row) for row in rows]
 
     finally:
         connection.close()
@@ -161,16 +171,15 @@ def get_products():
 
 @app.post("/products", status_code=201)
 def add_product(product: Product):
-
     connection = get_db_connection()
 
     try:
-
-        cursor = connection.execute(
+        row = connection.execute(
             """
             INSERT INTO products
                 (name, category, quantity, minimum_stock)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 product.name.strip(),
@@ -178,16 +187,18 @@ def add_product(product: Product):
                 product.quantity,
                 product.minimum_stock
             )
-        )
+        ).fetchone()
 
         connection.commit()
 
-        product_id = cursor.lastrowid
-
         return {
             "message": "Product added successfully",
-            "id": product_id
+            "id": row["id"]
         }
+
+    except Exception:
+        connection.rollback()
+        raise
 
     finally:
         connection.close()
@@ -199,19 +210,17 @@ def add_product(product: Product):
 
 @app.put("/products/{product_id}")
 def update_product(product_id: int, product: Product):
-
     connection = get_db_connection()
 
     try:
-
         cursor = connection.execute(
             """
             UPDATE products
-            SET name = ?,
-                category = ?,
-                quantity = ?,
-                minimum_stock = ?
-            WHERE id = ?
+            SET name = %s,
+                category = %s,
+                quantity = %s,
+                minimum_stock = %s
+            WHERE id = %s
             """,
             (
                 product.name.strip(),
@@ -223,6 +232,7 @@ def update_product(product_id: int, product: Product):
         )
 
         if cursor.rowcount == 0:
+            connection.rollback()
             raise HTTPException(
                 status_code=404,
                 detail="Product not found"
@@ -235,6 +245,10 @@ def update_product(product_id: int, product: Product):
             "id": product_id
         }
 
+    except Exception:
+        connection.rollback()
+        raise
+
     finally:
         connection.close()
 
@@ -245,17 +259,16 @@ def update_product(product_id: int, product: Product):
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id: int):
-
     connection = get_db_connection()
 
     try:
-
         cursor = connection.execute(
-            "DELETE FROM products WHERE id = ?",
+            "DELETE FROM products WHERE id = %s",
             (product_id,)
         )
 
         if cursor.rowcount == 0:
+            connection.rollback()
             raise HTTPException(
                 status_code=404,
                 detail="Product not found"
@@ -268,6 +281,10 @@ def delete_product(product_id: int):
             "id": product_id
         }
 
+    except Exception:
+        connection.rollback()
+        raise
+
     finally:
         connection.close()
 
@@ -278,14 +295,11 @@ def delete_product(product_id: int):
 
 @app.post("/stock/in")
 def stock_in(stock: StockChange):
-
     connection = get_db_connection()
 
     try:
-
-        # Find the product
         product = connection.execute(
-            "SELECT * FROM products WHERE id = ?",
+            "SELECT * FROM products WHERE id = %s FOR UPDATE",
             (stock.product_id,)
         ).fetchone()
 
@@ -295,25 +309,18 @@ def stock_in(stock: StockChange):
                 detail="Product not found"
             )
 
-        # Calculate the updated quantity
         new_quantity = product["quantity"] + stock.quantity
 
-        # Update product stock
         connection.execute(
-            """
-            UPDATE products
-            SET quantity = ?
-            WHERE id = ?
-            """,
+            "UPDATE products SET quantity = %s WHERE id = %s",
             (new_quantity, stock.product_id)
         )
 
-        # Record the stock movement
         connection.execute(
             """
             INSERT INTO stock_movements
                 (product_id, type, quantity, balance)
-            VALUES (?, 'IN', ?, ?)
+            VALUES (%s, 'IN', %s, %s)
             """,
             (
                 stock.product_id,
@@ -331,6 +338,10 @@ def stock_in(stock: StockChange):
             "current_stock": new_quantity
         }
 
+    except Exception:
+        connection.rollback()
+        raise
+
     finally:
         connection.close()
 
@@ -341,14 +352,11 @@ def stock_in(stock: StockChange):
 
 @app.post("/stock/out")
 def stock_out(stock: StockChange):
-
     connection = get_db_connection()
 
     try:
-
-        # Find the product
         product = connection.execute(
-            "SELECT * FROM products WHERE id = ?",
+            "SELECT * FROM products WHERE id = %s FOR UPDATE",
             (stock.product_id,)
         ).fetchone()
 
@@ -360,32 +368,24 @@ def stock_out(stock: StockChange):
 
         current_quantity = product["quantity"]
 
-        # Prevent stock from becoming negative
         if stock.quantity > current_quantity:
             raise HTTPException(
                 status_code=400,
                 detail=f"Only {current_quantity} units are available"
             )
 
-        # Calculate the remaining quantity
         new_quantity = current_quantity - stock.quantity
 
-        # Update product stock
         connection.execute(
-            """
-            UPDATE products
-            SET quantity = ?
-            WHERE id = ?
-            """,
+            "UPDATE products SET quantity = %s WHERE id = %s",
             (new_quantity, stock.product_id)
         )
 
-        # Record the stock movement
         connection.execute(
             """
             INSERT INTO stock_movements
                 (product_id, type, quantity, balance)
-            VALUES (?, 'OUT', ?, ?)
+            VALUES (%s, 'OUT', %s, %s)
             """,
             (
                 stock.product_id,
@@ -394,12 +394,11 @@ def stock_out(stock: StockChange):
             )
         )
 
-        # Record product usage
         connection.execute(
             """
             INSERT INTO usage_history
                 (product_id, quantity_used, remaining_stock)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
             """,
             (
                 stock.product_id,
@@ -417,6 +416,10 @@ def stock_out(stock: StockChange):
             "remaining_stock": new_quantity
         }
 
+    except Exception:
+        connection.rollback()
+        raise
+
     finally:
         connection.close()
 
@@ -427,29 +430,26 @@ def stock_out(stock: StockChange):
 
 @app.get("/stock/movements")
 def get_stock_movements():
-
     connection = get_db_connection()
 
     try:
-
-        movements = connection.execute(
+        rows = connection.execute(
             """
             SELECT
-                stock_movements.id,
-                stock_movements.product_id,
-                products.name AS product_name,
-                stock_movements.type,
-                stock_movements.quantity,
-                stock_movements.balance,
-                stock_movements.created_at
-            FROM stock_movements
-            JOIN products
-                ON products.id = stock_movements.product_id
-            ORDER BY stock_movements.id DESC
+                sm.id,
+                sm.product_id,
+                p.name AS product_name,
+                sm.type,
+                sm.quantity,
+                sm.balance,
+                sm.created_at
+            FROM stock_movements sm
+            JOIN products p ON p.id = sm.product_id
+            ORDER BY sm.id DESC
             """
         ).fetchall()
 
-        return [dict(movement) for movement in movements]
+        return [dict(row) for row in rows]
 
     finally:
         connection.close()
@@ -461,28 +461,25 @@ def get_stock_movements():
 
 @app.get("/usage")
 def get_usage_history():
-
     connection = get_db_connection()
 
     try:
-
-        usage_records = connection.execute(
+        rows = connection.execute(
             """
             SELECT
-                usage_history.id,
-                usage_history.product_id,
-                products.name AS product_name,
-                usage_history.quantity_used,
-                usage_history.remaining_stock,
-                usage_history.created_at
-            FROM usage_history
-            JOIN products
-                ON products.id = usage_history.product_id
-            ORDER BY usage_history.id DESC
+                uh.id,
+                uh.product_id,
+                p.name AS product_name,
+                uh.quantity_used,
+                uh.remaining_stock,
+                uh.created_at
+            FROM usage_history uh
+            JOIN products p ON p.id = uh.product_id
+            ORDER BY uh.id DESC
             """
         ).fetchall()
 
-        return [dict(record) for record in usage_records]
+        return [dict(row) for row in rows]
 
     finally:
         connection.close()
